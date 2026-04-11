@@ -90,7 +90,7 @@
   "settings.autodetect_success": "Found:\n{paths}",
   "settings.autodetect_fail": "Tor binaries not found.\n\nPlace tor.exe, lyrebird.exe, geoip, geoip6\nin the tor/ folder next to the application,\nor set the paths manually.",
   "settings.autodetect_title": "Auto-detect",
-  "settings.autostart_error": "Failed to add registry entry.\nMake sure you are running the .exe file (not a .py script).",
+  "settings.autostart_error": "Failed to add the registry entry.\nMake sure the app is running from the .exe file and try again.",
   "settings.autostart_error_title": "Autostart",
 
   "hint.tor_ok": "tor: {name}",

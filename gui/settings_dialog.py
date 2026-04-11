@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
@@ -6,14 +7,53 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QSpinBox, QCheckBox,
     QComboBox, QFileDialog, QDialogButtonBox, QGroupBox, QMessageBox,
 )
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
 from gui.styles import DARK_THEME
 from core.config import (
     find_tor_exe, find_lyrebird_exe,
-    set_windows_autostart, get_windows_autostart,
+    get_windows_autostart,
 )
 from core.i18n import tr, load_language, SUPPORTED_LANGUAGES
 
 logger = logging.getLogger(__name__)
+
+_AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_NAME = "TorProxyManager"
+
+
+def _set_windows_autostart_safe(enable: bool) -> bool:
+    if winreg is None:
+        return False
+
+    exe_path = Path(sys.executable).resolve()
+    if enable and exe_path.suffix.lower() != ".exe":
+        return False
+
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            _AUTOSTART_KEY,
+            0,
+            winreg.KEY_SET_VALUE,
+        )
+        if enable:
+            winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
+            logger.info("Autostart enabled: %s", exe_path)
+        else:
+            try:
+                winreg.DeleteValue(key, _AUTOSTART_NAME)
+                logger.info("Autostart disabled")
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        logger.exception("Failed to update Windows autostart")
+        return False
 
 
 class SettingsDialog(QDialog):
@@ -196,7 +236,7 @@ class SettingsDialog(QDialog):
         # Применяем язык немедленно — следующий tr() вызов уже использует новый
         load_language(new_lang)
 
-        ok = set_windows_autostart(self._autostart_windows.isChecked())
+        ok = _set_windows_autostart_safe(self._autostart_windows.isChecked())
         if self._autostart_windows.isChecked() and not ok:
             QMessageBox.warning(
                 self, tr("settings.autostart_error_title"),
