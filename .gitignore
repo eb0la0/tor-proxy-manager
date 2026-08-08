@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc.*
+.venv/
+venv/
+
+# PyInstaller
+build/
+build_*/
+dist/
+dist_*/
+*.manifest
+
+# Runtime artefacts
+*.log
+bridges.json.tmp
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+
+# Бинарники proxychains — распространяются отдельно, а не через репозиторий
+tools/*.exe
+tools/*.dll

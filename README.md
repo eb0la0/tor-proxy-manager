@@ -64,9 +64,113 @@ Relay → Relay → Exit Node → Интернет
 | **webtunnel** | Трафик маскируется под обычный HTTPS к CDN | Для сетей, где obfs4 заблокирован |
 | **vanilla** | Без маскировки - прямое подключение к мосту | Только для сетей без DPI |
 
+### Откуда берутся мосты
+
+Мосты собираются из нескольких независимых источников. Ни один источник —
+включая GitHub — не является обязательным: если он недоступен, обновление
+продолжается на остальных.
+
+| Источник | Приоритет | Зеркала |
+|----------|-----------|---------|
+| **igareck / vpn-configs-for-russia** | высший | GitLab → Codeberg → Gitea → githack → GitHub |
+| **scriptzteam Tor-Bridges-Collector-v2** (проверенные) | высокий | githack → GitHub |
+| **OnionHop-Bridges-Collector** (проверенные) | высокий | githack → GitHub |
+| **scriptzteam v2 / OnionHop** (полные списки) | средний | githack → GitHub |
+| **scriptzteam Tor-Bridges-Collector** (v1) | низкий | только GitHub¹ |
+
+¹ У этого репозитория файлы без расширения, а githack такие пути не
+проксирует — он редиректит их обратно на GitHub. Поэтому при блокировке
+GitHub источник недоступен, и зеркало-обманку в списке не держим.
+
+Внутри одного источника зеркала содержат одни и те же данные и перебираются
+**по очереди** до первого успеха. Не-GitHub зеркала стоят первыми — это и есть
+защита от блокировки GitHub в РФ. Разные источники загружаются **параллельно**,
+поэтому мёртвый источник не задерживает обновление.
+
+Добавить новый источник — одна запись в `core/bridge_sources.py`; остальной код
+менять не нужно.
+
+#### Источники, поставщики и зеркала — это разные вещи
+
+Шесть строк в таблице выше — это шесть **файлов**, но не шесть независимых
+точек отказа:
+
+| Уровень | Сколько | Что означает |
+|---------|---------|--------------|
+| Файлы (источники) | 6 | Отдельные списки, сливаются по приоритету |
+| **Поставщики** | **4** | igareck, scriptzteam-v2, onionhop, scriptzteam-v1 |
+| Хостинги вне GitHub | 3 | GitLab, Codeberg, Gitea — все только у igareck |
+
+«Проверенный» и «полный» списки одного репозитория недоступны одновременно,
+поэтому в интерфейсе показывается число **поставщиков** («Источники: 3/4»),
+а не число файлов. Показывать «6/6» значило бы обещать запас прочности,
+которого нет.
+
+Важно и другое: сами мосты у поставщиков в основном одни и те же — все они
+черпают из общей сети распространения мостов Tor. Замер 2026-08-08 для obfs4:
+99.5 % мостов igareck присутствуют и в scriptzteam-v1, а уникальный вклад
+пяти из шести источников равен нулю. Ценность нескольких источников здесь —
+не в разных мостах, а в **независимых каналах доставки**: блокировка или
+отказ одного хостинга не оставляет пользователя без списка.
+
+### Как работает fallback
+
+```
+Нажата «Обновить мосты»
+        │
+        ▼
+Все источники опрашиваются параллельно (общий дедлайн 60 с)
+        │   каждый источник перебирает свои зеркала по очереди
+        ▼
+Результаты сливаются по приоритету источника
+        │
+        ▼
+Валидация → нормализация → дедупликация (по fingerprint и по IP)
+        │
+        ▼
+Проверка доступности (TCP/TLS), отбор лучших по задержке
+        │
+        ├── есть рабочие мосты  → кеш обновляется
+        └── рабочих мостов нет  → кеш СОХРАНЯЕТСЯ, работаем на прежних мостах
+```
+
+Что видит пользователь:
+
+| Ситуация | Поведение |
+|----------|-----------|
+| Все поставщики ответили | «Источники: 4/4», список мостов обновлён |
+| Часть поставщиков недоступна | «Источники: 3/4», обновление прошло успешно |
+| GitHub заблокирован | Данные берутся с GitLab / Codeberg / Gitea / githack |
+| Все источники недоступны | Используются сохранённые мосты, с указанием их возраста |
+| Источников нет и кеша нет | Понятное сообщение с просьбой проверить интернет |
+
+Ответ `HTTP 200` с HTML-страницей ошибки, неверный `Content-Type`, слишком
+большой ответ и межхостовый редирект **не** считаются успешной загрузкой —
+зеркало помечается непригодным, и перебор идёт дальше.
+
+Отдельно различается **пустой ответ**: если файл получен, но мостов в нём нет,
+это корректный ответ «сейчас мостов нет», а не отказ источника. Такой источник
+считается ответившим.
+
+«0 мостов» тоже не одно состояние, а четыре, и приложение сообщает именно то,
+что произошло: ни один источник не ответил / источники ответили мусором /
+источники честно пусты / мосты получены, но ни один не отвечает по сети.
+
+### Как работает кеш
+
+Последний успешный набор мостов хранится в `~/.tor_proxy_manager/bridges.json`
+вместе с типом мостов и временем обновления.
+
+- Кеш загружается при старте, если его тип совпадает с текущим типом мостов.
+- **Пустой результат никогда не перезаписывает кеш** — неудачное обновление не
+  может лишить вас мостов, которые уже работали.
+- Запись атомарная: выключение питания во время сохранения не повредит файл.
+- Повреждённый, пустой или обрезанный кеш не роняет приложение — он просто
+  игнорируется.
+
 ## Возможности
 
-- **Автоматический сбор мостов** - параллельная загрузка из 8+ открытых источников с дедупликацией по fingerprint и IP
+- **Автоматический сбор мостов** - параллельная загрузка из 4 независимых поставщиков (6 списков, до 5 зеркал у каждого) с дедупликацией по fingerprint и IP
 - **Тестирование мостов** - TCP-проба для obfs4/vanilla, TLS handshake с проверкой сертификата для webtunnel
 - **Валидация формата** - отсев мостов без обязательных полей, с приватными IP, из чёрного списка
 - **SOCKS5-прокси** на `127.0.0.1:9050` (порт настраивается)
@@ -90,7 +194,7 @@ Relay → Relay → Exit Node → Интернет
 
 ### Для пользователей (готовый .exe)
 
-1. Скачайте `TorProxyManager_v1.0.zip` со страницы [Releases](../../releases)
+1. Скачайте `TorProxyManager_v2.0.zip` со страницы [Releases](../../releases)
 2. Распакуйте архив
 3. Запустите `TorProxyManager.exe`
 
@@ -196,7 +300,9 @@ tor_proxy_manager/
 │   ├── config.py            # Конфигурация, пути, автозапуск
 │   ├── tor_manager.py       # Управление tor.exe, watchdog'и
 │   ├── torrc_builder.py     # Генерация torrc
-│   ├── bridge_fetcher.py    # Параллельный сбор мостов
+│   ├── bridge_sources.py    # Реестр источников и зеркал мостов
+│   ├── bridge_fetcher.py    # Многоисточниковый сбор мостов с fallback
+│   ├── bridge_cache.py      # Кеш последнего рабочего набора мостов
 │   ├── bridge_tester.py     # TCP/TLS тестирование мостов
 │   ├── bridge_validator.py  # Валидация формата и IP
 │   ├── app_proxy.py         # Запуск приложений через прокси
@@ -206,10 +312,23 @@ tor_proxy_manager/
 │   ├── settings_dialog.py   # Настройки
 │   ├── tray_icon.py         # Системный трей
 │   ├── app_proxy_widget.py  # UI управления приложениями
-│   └── styles.py            # Тёмная тема
+│   ├── theme.py             # Design-система: цвета, отступы, типографика
+│   ├── widgets.py           # Переиспользуемые элементы интерфейса
+│   └── icons.py             # Иконки, рисуемые кодом (без зависимостей)
+├── tests/                   # Тесты (stdlib unittest, сеть не нужна)
 └── dist/
     └── TorProxyManager.exe  # Собранный EXE
 ```
+
+### Тесты
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+Тесты не требуют сети и дополнительных зависимостей: HTTP-слой подменяется
+заглушками. Покрыты парсинг и валидация мостов, дедупликация, перебор зеркал,
+матрица отказов источников и повреждения кеша.
 
 ## Использование
 
@@ -413,9 +532,111 @@ Relay → Relay → Exit Node → Internet
 | **webtunnel** | Traffic disguised as regular HTTPS to a CDN | For networks where obfs4 is blocked |
 | **vanilla** | No disguise — direct connection to bridge | Only for networks without DPI |
 
+### Where bridges come from
+
+Bridges are collected from several independent sources. No single source —
+GitHub included — is required: if one is unreachable, the update continues with
+the rest.
+
+| Source | Priority | Mirrors |
+|--------|----------|---------|
+| **igareck / vpn-configs-for-russia** | highest | GitLab → Codeberg → Gitea → githack → GitHub |
+| **scriptzteam Tor-Bridges-Collector-v2** (tested) | high | githack → GitHub |
+| **OnionHop-Bridges-Collector** (tested) | high | githack → GitHub |
+| **scriptzteam v2 / OnionHop** (full lists) | medium | githack → GitHub |
+| **scriptzteam Tor-Bridges-Collector** (v1) | low | GitHub only¹ |
+
+¹ This repository's files have no extension, and githack does not proxy such
+paths — it redirects them back to GitHub. So the source is unavailable when
+GitHub is blocked, and we do not keep a mirror that only pretends to help.
+
+Within one source the mirrors serve identical data and are tried **in order**
+until one succeeds. Non-GitHub mirrors come first — that is the protection
+against GitHub being blocked. Different sources are fetched **in parallel**, so
+a dead source never delays the update.
+
+Adding a new source is a single entry in `core/bridge_sources.py`; no other code
+needs to change.
+
+#### Sources, providers and mirrors are not the same thing
+
+The six rows above are six **files**, not six independent points of failure:
+
+| Level | Count | Meaning |
+|-------|-------|---------|
+| Files (sources) | 6 | Separate lists, merged by priority |
+| **Providers** | **4** | igareck, scriptzteam-v2, onionhop, scriptzteam-v1 |
+| Non-GitHub hosts | 3 | GitLab, Codeberg, Gitea — all belong to igareck |
+
+The "tested" and "full" lists of one repository go down together, so the UI
+reports the number of **providers** ("Sources: 3/4"), not the number of files.
+Showing "6/6" would promise redundancy that does not exist.
+
+There is a second caveat: the bridges themselves largely coincide across
+providers — they all draw from Tor's common bridge distribution. Measured on
+2026-08-08 for obfs4: 99.5 % of igareck's bridges also appear in
+scriptzteam-v1, and five of the six sources contribute zero unique bridges.
+The value of multiple sources here is not different bridges but **independent
+delivery channels**: one host being blocked or down does not leave the user
+without a list.
+
+### How the fallback works
+
+```
+"Update bridges" pressed
+        │
+        ▼
+All sources queried in parallel (60 s overall deadline)
+        │   each source walks its mirrors in order
+        ▼
+Results merged by source priority
+        │
+        ▼
+Validate → normalize → deduplicate (by fingerprint and by IP)
+        │
+        ▼
+Reachability test (TCP/TLS), best-by-latency selected
+        │
+        ├── working bridges found → cache updated
+        └── none found           → cache KEPT, previous bridges stay in use
+```
+
+What the user sees:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| All providers responded | "Sources: 4/4", bridge list updated |
+| Some providers unreachable | "Sources: 3/4", update still succeeds |
+| GitHub blocked | Data served from GitLab / Codeberg / Gitea / githack |
+| All sources unreachable | Cached bridges are used, with their age shown |
+| No sources and no cache | Clear message asking to check the connection |
+
+An `HTTP 200` carrying an HTML error page, an unexpected `Content-Type`, an
+oversized response or a cross-host redirect are **not** treated as a successful
+download — the mirror is marked unusable and the walk continues.
+
+An **empty** body is handled separately: a file that arrives with no bridges in
+it is a valid "no bridges right now" answer, not a source failure, and the
+source still counts as having responded.
+
+"0 bridges" is likewise not one state but four, and the app reports the one that
+actually happened: no source answered / sources answered with garbage / sources
+are legitimately empty / bridges arrived but none is reachable.
+
+### How the cache works
+
+The last successful bridge set is stored in `~/.tor_proxy_manager/bridges.json`
+together with the bridge type and the update timestamp.
+
+- The cache is loaded at startup if its type matches the current bridge type.
+- **An empty result never overwrites the cache** — a failed update cannot take
+  away bridges that were already working.
+- Writes are atomic: losing power mid-save cannot corrupt the file.
+- A corrupted, empty or truncated cache never crashes the app; it is ignored.
+
 ## Features
 
-- **Automatic bridge collection** — parallel fetch from 8+ open sources with fingerprint and IP deduplication
+- **Automatic bridge collection** — parallel fetch from 4 independent providers (6 lists, up to 5 mirrors each) with fingerprint and IP deduplication
 - **Bridge testing** — TCP probe for obfs4/vanilla, TLS handshake with certificate validation for webtunnel
 - **Format validation** — rejects bridges with missing fields, private IPs, blacklisted addresses
 - **SOCKS5 proxy** at `127.0.0.1:9050` (port configurable)
@@ -439,7 +660,7 @@ Relay → Relay → Exit Node → Internet
 
 ### For users (pre-built .exe)
 
-1. Download `TorProxyManager_v1.0.zip` from the [Releases](../../releases) page
+1. Download `TorProxyManager_v2.0.zip` from the [Releases](../../releases) page
 2. Extract the archive
 3. Run `TorProxyManager.exe`
 
@@ -545,9 +766,11 @@ tor_proxy_manager/
 │   ├── config.py            # Configuration, paths, autostart
 │   ├── tor_manager.py       # Tor process management, watchdogs
 │   ├── torrc_builder.py     # torrc generation
-│   ├── bridge_fetcher.py    # Parallel bridge fetching
+│   ├── bridge_fetcher.py    # Multi-source bridge fetching with fallback
 │   ├── bridge_tester.py     # TCP/TLS bridge testing
 │   ├── bridge_validator.py  # Format and IP validation
+│   ├── bridge_sources.py    # Bridge source and mirror registry
+│   ├── bridge_cache.py      # Last-known-good bridge cache
 │   ├── app_proxy.py         # Per-app proxy launcher
 │   └── i18n.py              # Translation system
 ├── gui/
@@ -555,10 +778,23 @@ tor_proxy_manager/
 │   ├── settings_dialog.py   # Settings dialog
 │   ├── tray_icon.py         # System tray
 │   ├── app_proxy_widget.py  # App proxy management UI
-│   └── styles.py            # Dark theme
+│   ├── theme.py             # Design system: colors, spacing, typography
+│   ├── widgets.py           # Reusable UI building blocks
+│   └── icons.py             # Code-drawn icons (no dependencies)
+├── tests/                   # Tests (stdlib unittest, no network needed)
 └── dist/
     └── TorProxyManager.exe  # Built executable
 ```
+
+### Tests
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+No network and no extra dependencies are required — the HTTP layer is stubbed.
+Coverage includes bridge parsing and validation, deduplication, mirror
+fall-through, the source failure matrix, and cache corruption handling.
 
 ## Usage
 

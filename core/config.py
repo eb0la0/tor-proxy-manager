@@ -105,6 +105,22 @@ _AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_NAME = "TorProxyManager"
 
 
+def _autostart_command() -> str:
+    """
+    Команда для записи в реестр автозапуска.
+
+    В собранном виде sys.executable — это сам TorProxyManager.exe.
+    При запуске из исходников это python.exe, и записать его одного мало:
+    интерпретатор без скрипта просто откроет REPL. Поэтому в dev-режиме
+    дописываем путь к main.py.
+    """
+    exe = sys.executable
+    if getattr(sys, "frozen", False):
+        return f'"{exe}"'
+    entry = APP_DIR / "main.py"
+    return f'"{exe}" "{entry}"'
+
+
 def set_windows_autostart(enable: bool) -> bool:
     """Добавляет/удаляет запись автозапуска в реестре Windows."""
     if not _HAS_WINREG:
@@ -116,16 +132,19 @@ def set_windows_autostart(enable: bool) -> bool:
             0,
             winreg.KEY_SET_VALUE,
         )
-        if enable:
-            winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, f'"{sys.executable}"')
-            logger.info(f"Автозапуск включён: {exe}")
-        else:
-            try:
-                winreg.DeleteValue(key, _AUTOSTART_NAME)
-                logger.info("Автозапуск отключён")
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
+        try:
+            if enable:
+                command = _autostart_command()
+                winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, command)
+                logger.info(f"Автозапуск включён: {command}")
+            else:
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_NAME)
+                    logger.info("Автозапуск отключён")
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
         return True
     except Exception as e:
         logger.error(f"Ошибка реестра автозапуска: {e}")

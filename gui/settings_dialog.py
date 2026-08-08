@@ -1,59 +1,21 @@
 import logging
-import sys
-from pathlib import Path
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QGridLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QSpinBox, QCheckBox,
-    QComboBox, QFileDialog, QDialogButtonBox, QGroupBox, QMessageBox,
+    QFileDialog, QDialogButtonBox, QGroupBox, QMessageBox,
 )
 
-try:
-    import winreg
-except ImportError:
-    winreg = None
-from gui.styles import DARK_THEME
+from gui import theme
+from gui.widgets import Select
 from core.config import (
     find_tor_exe, find_lyrebird_exe,
-    get_windows_autostart,
+    get_windows_autostart, set_windows_autostart,
 )
 from core.i18n import tr, load_language, SUPPORTED_LANGUAGES
 
 logger = logging.getLogger(__name__)
 
-_AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_AUTOSTART_NAME = "TorProxyManager"
-
-
-def _set_windows_autostart_safe(enable: bool) -> bool:
-    if winreg is None:
-        return False
-
-    exe_path = Path(sys.executable).resolve()
-    if enable and exe_path.suffix.lower() != ".exe":
-        return False
-
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            _AUTOSTART_KEY,
-            0,
-            winreg.KEY_SET_VALUE,
-        )
-        if enable:
-            winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
-            logger.info("Autostart enabled: %s", exe_path)
-        else:
-            try:
-                winreg.DeleteValue(key, _AUTOSTART_NAME)
-                logger.info("Autostart disabled")
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
-        return True
-    except Exception:
-        logger.exception("Failed to update Windows autostart")
-        return False
 
 
 class SettingsDialog(QDialog):
@@ -62,7 +24,7 @@ class SettingsDialog(QDialog):
         self.config = config
         self.setWindowTitle(tr("settings.title"))
         self.setMinimumWidth(580)
-        self.setStyleSheet(DARK_THEME)
+        self.setStyleSheet(theme.THEME)
         self._build_ui()
         self._load_values()
 
@@ -150,7 +112,8 @@ class SettingsDialog(QDialog):
         startup_layout.addWidget(self._autostart_windows)
 
         hint = QLabel(tr("settings.autostart_hint"))
-        hint.setStyleSheet("color: #6a6a8a; font-size: 11px;")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {theme.TEXT_MUTE}; font-size: {theme.FS_CAPTION}px;")
         startup_layout.addWidget(hint)
 
         layout.addWidget(startup_group)
@@ -160,7 +123,7 @@ class SettingsDialog(QDialog):
         lang_layout = QHBoxLayout(lang_group)
         lang_layout.setSpacing(10)
 
-        self._lang_combo = QComboBox()
+        self._lang_combo = Select()
         self._lang_combo.setFixedWidth(160)
         for code, name in SUPPORTED_LANGUAGES.items():
             self._lang_combo.addItem(name, code)
@@ -170,6 +133,17 @@ class SettingsDialog(QDialog):
         layout.addWidget(lang_group)
 
         # ---- Кнопки диалога ----
+        # Версия живёт здесь, а не в шапке главного окна: там она была
+        # метаданными без назначения.
+        from gui.main_window import APP_VERSION
+        ver_row = QHBoxLayout()
+        ver = QLabel(tr("settings.version", v=APP_VERSION))
+        ver.setStyleSheet(
+            f"color: {theme.TEXT_MUTE}; font-size: {theme.FS_CAPTION}px;")
+        ver_row.addWidget(ver)
+        ver_row.addStretch()
+        layout.addLayout(ver_row)
+
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         btns.button(QDialogButtonBox.Save).setText(tr("btn.save"))
         btns.button(QDialogButtonBox.Cancel).setText(tr("btn.cancel"))
@@ -236,7 +210,7 @@ class SettingsDialog(QDialog):
         # Применяем язык немедленно — следующий tr() вызов уже использует новый
         load_language(new_lang)
 
-        ok = _set_windows_autostart_safe(self._autostart_windows.isChecked())
+        ok = set_windows_autostart(self._autostart_windows.isChecked())
         if self._autostart_windows.isChecked() and not ok:
             QMessageBox.warning(
                 self, tr("settings.autostart_error_title"),

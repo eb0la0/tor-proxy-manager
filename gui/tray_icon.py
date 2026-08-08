@@ -3,7 +3,11 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QBrush, QPixmap, QPainter, QPainterPath, QIcon, QPen, QFont
 from PyQt5.QtWidgets import QSystemTrayIcon, QMenu, QAction, QApplication
 
-from gui.styles import COLOR_CONNECTED, COLOR_DISCONNECTED, COLOR_CONNECTING
+from gui import theme
+
+COLOR_CONNECTED = theme.OK
+COLOR_DISCONNECTED = theme.ERR
+COLOR_CONNECTING = theme.WARN
 from core.i18n import tr
 
 logger = logging.getLogger(__name__)
@@ -15,7 +19,7 @@ def _circle_icon(color: str, size: int = 32) -> QIcon:
     pix.fill(Qt.transparent)
     p = QPainter(pix)
     p.setRenderHint(QPainter.Antialiasing)
-    p.setBrush(QBrush(QColor("#0f0f1a")))
+    p.setBrush(QBrush(QColor(theme.BG)))
     p.setPen(Qt.NoPen)
     p.drawEllipse(0, 0, size, size)
     r = 5
@@ -34,8 +38,8 @@ def create_app_icon() -> QIcon:
     p.setRenderHint(QPainter.Antialiasing)
 
     # Фон — скруглённый квадрат
-    p.setBrush(QBrush(QColor("#0f0f1a")))
-    p.setPen(QPen(QColor("#7c5cbf"), 2))
+    p.setBrush(QBrush(QColor(theme.BG)))
+    p.setPen(QPen(QColor(theme.ACCENT), 2))
     p.drawRoundedRect(2, 2, size - 4, size - 4, 12, 12)
 
     # Щит
@@ -48,12 +52,12 @@ def create_app_icon() -> QIcon:
     path.lineTo(size - 10, size / 2 + 6)  # правый бок
     path.closeSubpath()
 
-    p.setBrush(QBrush(QColor("#7c5cbf")))
+    p.setBrush(QBrush(QColor(theme.ACCENT)))
     p.setPen(Qt.NoPen)
     p.drawPath(path)
 
     # Буква «T»
-    p.setPen(QPen(QColor("#e0e0e0")))
+    p.setPen(QPen(QColor(theme.TEXT)))
     font = QFont("Arial", 20, QFont.Bold)
     p.setFont(font)
     p.drawText(pix.rect(), Qt.AlignCenter, "T")

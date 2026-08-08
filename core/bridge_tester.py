@@ -129,18 +129,39 @@ class BridgeTesterThread(QThread):
 
     MAX_SAMPLE = 250
 
+    # Доля выборки, которая берётся с начала списка без перемешивания.
+    # Список приходит отсортированным по приоритету источника, поэтому в голове
+    # находятся курируемые и предпроверенные мосты. Чисто случайная выборка
+    # из тысяч мостов почти гарантированно их бы потеряла.
+    HEAD_RATIO = 0.6
+
     def __init__(self, bridges: list, timeout: int = 10, top_n: int = 20, workers: int = 30):
         super().__init__()
         self.timeout = timeout
         self.top_n = top_n
         self.workers = workers
         self._cancelled = False
+        self.bridges = self._make_sample(bridges)
 
-        if len(bridges) > self.MAX_SAMPLE:
-            self.bridges = random.sample(bridges, self.MAX_SAMPLE)
-            logger.info(f"Выборка: {self.MAX_SAMPLE} из {len(bridges)} мостов")
-        else:
-            self.bridges = list(bridges)
+    def _make_sample(self, bridges: list) -> list:
+        """
+        Выборка = голова списка (лучшие источники) + случайные из остатка.
+        Случайная часть нужна, чтобы при каждом обновлении пробовались разные
+        мосты и набор не «залипал» на одних и тех же мёртвых адресах.
+        """
+        if len(bridges) <= self.MAX_SAMPLE:
+            return list(bridges)
+
+        head_n = int(self.MAX_SAMPLE * self.HEAD_RATIO)
+        head = list(bridges[:head_n])
+        tail_n = self.MAX_SAMPLE - len(head)
+        tail = random.sample(bridges[head_n:], tail_n)
+
+        logger.info(
+            f"Выборка: {self.MAX_SAMPLE} из {len(bridges)} мостов "
+            f"({len(head)} приоритетных + {len(tail)} случайных)"
+        )
+        return head + tail
 
     def cancel(self):
         self._cancelled = True
@@ -155,32 +176,35 @@ class BridgeTesterThread(QThread):
         results = []
         completed = 0
 
+        # Executor создаётся без `with`: при отмене нельзя дожидаться очереди
+        # из сотен проверок по self.timeout секунд каждая — выход из приложения
+        # должен быть быстрым.
+        executor = ThreadPoolExecutor(max_workers=self.workers)
+        cancelled = False
         try:
-            with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                futures = [
-                    executor.submit(test_bridge, b, self.timeout)
-                    for b in self.bridges
-                ]
-                for future in as_completed(futures):
-                    if self._cancelled:
-                        for f in futures:
-                            f.cancel()
-                        return
+            futures = [
+                executor.submit(test_bridge, b, self.timeout)
+                for b in self.bridges
+            ]
+            for future in as_completed(futures):
+                if self._cancelled:
+                    cancelled = True
+                    return
 
-                    completed += 1
-                    try:
-                        bridge_line, latency = future.result()
-                        if latency is not None:
-                            results.append((bridge_line, latency))
-                    except Exception as e:
-                        logger.debug(f"Ошибка теста: {e}")
+                completed += 1
+                try:
+                    bridge_line, latency = future.result()
+                    if latency is not None:
+                        results.append((bridge_line, latency))
+                except Exception as e:
+                    logger.debug(f"Ошибка теста: {e}")
 
-                    if completed % 20 == 0 or completed == total:
-                        pct = int(completed / total * 100)
-                        self.progress.emit(
-                            pct,
-                            f"Протестировано {completed}/{total}, рабочих: {len(results)}"
-                        )
+                if completed % 20 == 0 or completed == total:
+                    pct = int(completed / total * 100)
+                    self.progress.emit(
+                        pct,
+                        f"Протестировано {completed}/{total}, рабочих: {len(results)}"
+                    )
 
             results.sort(key=lambda x: x[1])
             top = results[: self.top_n]
@@ -193,3 +217,7 @@ class BridgeTesterThread(QThread):
         except Exception as e:
             logger.error(f"Ошибка тестирования: {e}")
             self.error.emit(str(e))
+        finally:
+            # cancel_futures отбрасывает не начатые проверки; уже открытые
+            # сокеты доработают до своего таймаута в фоне.
+            executor.shutdown(wait=not cancelled, cancel_futures=cancelled)

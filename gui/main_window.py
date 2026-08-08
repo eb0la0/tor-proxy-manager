@@ -1,38 +1,41 @@
-import json
+import html
 import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QProgressBar, QTextEdit,
-    QComboBox, QGroupBox, QApplication, QFrame,
-    QSizePolicy, QScrollArea, QMessageBox,
+    QApplication, QFrame, QScrollArea, QMessageBox,
 )
 
-from core.config import Config, BRIDGES_FILE, TORRC_FILE
-from core.i18n import tr
+from core.config import Config
+from core.i18n import current_language, tr
+from core import bridge_cache
 from core.bridge_fetcher import BridgeFetcherThread
 from core.bridge_tester import BridgeTesterThread
 from core.torrc_builder import build_and_save_torrc
 from core.tor_manager import TorManager
-from gui.styles import (
-    DARK_THEME, BTN_CONNECT_STYLE, BTN_DISCONNECT_STYLE, BTN_CONNECTING_STYLE,
-    CARD_DEFAULT, CARD_CONNECTED, CARD_CONNECTING,
-    BADGE_SOCKS,
-    COLOR_CONNECTED, COLOR_DISCONNECTED, COLOR_CONNECTING,
-    dot_pixmap,
+from gui import icons, theme
+from gui.widgets import (
+    Card, EmptyState, ResponsiveRow, Select,
+    hline, icon_button, label, text_button,
 )
 
 logger = logging.getLogger(__name__)
 
-APP_VERSION = "1.0"
+APP_VERSION = "2.0"
 
-_ACCENT = "#7c5cbf"
-_ACCENT_LT = "#9370db"
+# Сколько ждать штатного завершения рабочих потоков при выходе.
+# Держать пользователя дольше пары секунд нельзя.
+_SHUTDOWN_GRACE_MS = 2000
+
+# Потоки, не успевшие завершиться к моменту выхода. Ссылка на уровне модуля
+# не даёт сборщику мусора разрушить работающий QThread (это фатально для Qt).
+_LINGERING_THREADS: list = []
 
 
 class MainWindow(QMainWindow):
@@ -64,6 +67,10 @@ class MainWindow(QMainWindow):
 
         self._user_requested_update: bool = False
         self._pending_connect_after_update: bool = False
+        self._last_fetch_result = None
+        self._retired_threads: list = []
+        self._updating_type: str = ""
+        self._using_cache: bool = False
         self._stall_retries: int = 0
         self._no_bridges_warned: bool = False
 
@@ -71,6 +78,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._load_bridges_cache()
         self._refresh_time_labels()
+        self._btn_connect.setFocus()
         QTimer.singleShot(800, self._check_auto_update)
 
 
@@ -78,241 +86,265 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         self.setWindowTitle("TorProxy Manager")
-        self.setMinimumWidth(580)
-        self.setMinimumHeight(660)
-        self.setStyleSheet(DARK_THEME)
+        self.setMinimumWidth(theme.WINDOW_MIN_W)
+        self.setMinimumHeight(theme.WINDOW_MIN_H)
+        # Дефолт рассчитан так, чтобы весь dashboard был виден без прокрутки.
+        self.resize(940, 660)
+        self.setStyleSheet(theme.THEME)
 
-        main_tab = QWidget()
-        self.setCentralWidget(main_tab)
-        self._build_main_tab(main_tab)
+        root_widget = QWidget()
+        self.setCentralWidget(root_widget)
 
-    def _build_main_tab(self, parent: QWidget):
+        outer = QVBoxLayout(root_widget)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Шапка закреплена: она не должна уезжать при прокрутке содержимого.
+        outer.addWidget(self._make_header())
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer.addWidget(scroll, 1)
 
         container = QWidget()
         scroll.setWidget(container)
 
-        root = QVBoxLayout(container)
-        root.setSpacing(10)
-        root.setContentsMargins(16, 16, 16, 16)
+        col = QVBoxLayout(container)
+        col.setSpacing(theme.SP_3)
+        col.setContentsMargins(theme.SP_4, theme.SP_3, theme.SP_4, theme.SP_4)
 
-        root.addWidget(self._make_header())
-        root.addSpacing(2)
-        root.addWidget(self._make_status_card())
-        root.addSpacing(2)
-        root.addWidget(self._make_connect_btn())
-        root.addSpacing(6)
-        root.addWidget(self._make_app_proxy_block())
-        root.addSpacing(2)
-        root.addWidget(self._make_bridges_block())
-        root.addSpacing(2)
-        root.addWidget(self._make_log_block())
-        root.addSpacing(4)
-        root.addWidget(self._make_settings_row())
-        root.addStretch()
+        # Герой во всю ширину — статус Tor остаётся главным акцентом.
+        col.addWidget(self._make_hero())
 
-        tab_lay = QVBoxLayout(parent)
-        tab_lay.setContentsMargins(0, 0, 0, 0)
-        tab_lay.addWidget(scroll)
+        # Мосты и приложения — рядом на широком окне, друг под другом на узком.
+        self._columns = ResponsiveRow(breakpoint=800)
+        self._columns.set_widgets(self._make_bridges_card(), self._make_apps_card())
+        col.addWidget(self._columns, 1)
+
+        col.addWidget(self._make_activity_card())
 
     # ---- Header ----
-    def _make_header(self) -> QFrame:
-        frame = QFrame()
-        frame.setObjectName("card")
-        frame.setStyleSheet(CARD_DEFAULT)
-        lay = QHBoxLayout(frame)
-        lay.setContentsMargins(16, 12, 16, 12)
+    def _make_header(self) -> QWidget:
+        bar = QWidget()
+        bar.setStyleSheet(f"background-color: {theme.BG};")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(theme.SP_4, theme.SP_3, theme.SP_3, theme.SP_3)
+        lay.setSpacing(theme.SP_3)
 
-        icon_lbl = QLabel()
-        from gui.tray_icon import create_app_icon
-        icon_lbl.setPixmap(create_app_icon().pixmap(32, 32))
-        lay.addWidget(icon_lbl)
-        lay.addSpacing(8)
+        mark = QLabel()
+        mark.setPixmap(icons.pixmap("shield", 22, theme.ACCENT))
+        lay.addWidget(mark)
 
-        title = QLabel("TorProxy Manager")
-        title.setObjectName("lbl_title")
-        title.setFont(QFont("Segoe UI", 17, QFont.Bold))
-        lay.addWidget(title)
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        titles.addWidget(label("TorProxy Manager", "app_title"))
+        titles.addWidget(label(tr("app.subtitle"), "caption"))
+        lay.addLayout(titles)
         lay.addStretch()
 
-        ver = QLabel(f"v{APP_VERSION}")
-        ver.setObjectName("lbl_version")
-        lay.addWidget(ver)
-        return frame
+        # Версия переехала в «Настройки»: в шапке она висела без назначения.
+        self._btn_settings = icon_button("settings", tr("btn.settings"), theme.ICON_LG)
+        self._btn_settings.clicked.connect(self._open_settings)
+        lay.addWidget(self._btn_settings)
 
-    # ---- Status card ----
-    def _make_status_card(self) -> QFrame:
+        wrap = QWidget()
+        wrap_lay = QVBoxLayout(wrap)
+        wrap_lay.setContentsMargins(0, 0, 0, 0)
+        wrap_lay.setSpacing(0)
+        wrap_lay.addWidget(bar)
+        wrap_lay.addWidget(hline())
+        return wrap
+
+    # ---- Hero: состояние подключения ----
+    def _make_hero(self) -> QFrame:
+        """
+        Одна плотная строка вместо трёх ярусов: статус слева, адрес прокси
+        по центру, действие справа. Раньше блок занимал треть экрана.
+        """
         self._status_card = QFrame()
-        self._status_card.setObjectName("card")
-        self._status_card.setStyleSheet(CARD_DEFAULT)
+        self._status_card.setObjectName("hero")
+        self._status_card.setStyleSheet(theme.hero_style())
+
         lay = QVBoxLayout(self._status_card)
-        lay.setContentsMargins(16, 12, 16, 12)
-        lay.setSpacing(10)
+        lay.setContentsMargins(theme.SP_5, theme.SP_4, theme.SP_5, theme.SP_4)
+        lay.setSpacing(theme.SP_3)
 
-        top = QHBoxLayout()
+        row = QHBoxLayout()
+        row.setSpacing(theme.SP_4)
+
         self._dot = QLabel()
-        self._dot.setFixedSize(14, 14)
-        self._dot.setPixmap(dot_pixmap(COLOR_DISCONNECTED, 14))
-        top.addWidget(self._dot)
-        top.addSpacing(6)
+        self._dot.setFixedSize(28, 28)
+        self._dot.setAlignment(Qt.AlignCenter)
+        self._dot.setPixmap(icons.dot(theme.ERR, 9, glow=True))
+        row.addWidget(self._dot, 0, Qt.AlignVCenter)
 
-        self._status_lbl = QLabel(tr("status.disconnected"))
-        self._status_lbl.setFont(QFont("Segoe UI", 14, QFont.Bold))
-        top.addWidget(self._status_lbl)
-        top.addStretch()
+        texts = QVBoxLayout()
+        texts.setSpacing(1)
+        self._status_lbl = label(tr("status.disconnected"), "hero_status")
+        texts.addWidget(self._status_lbl)
+        self._status_hint = label(tr("status.hint.disconnected"), "secondary")
+        texts.addWidget(self._status_hint)
+        row.addLayout(texts)
+        row.addStretch()
 
-        self._uptime_lbl = QLabel("")
-        self._uptime_lbl.setObjectName("lbl_secondary")
-        self._uptime_lbl.setFont(QFont("JetBrains Mono", 11))
-        top.addWidget(self._uptime_lbl)
-        lay.addLayout(top)
+        # Адрес прокси рядом со статусом: это то, что копируют чаще всего.
+        addr = QVBoxLayout()
+        addr.setSpacing(1)
+        addr_head = QHBoxLayout()
+        addr_head.setSpacing(theme.SP_1)
+        addr_head.addWidget(label(tr("proxy.label"), "caption"))
+        self._uptime_lbl = label("", "caption")
+        addr_head.addWidget(self._uptime_lbl)
+        addr_head.addStretch()
+        addr.addLayout(addr_head)
 
-        bottom = QHBoxLayout()
-        badge = QLabel("SOCKS5")
-        badge.setStyleSheet(BADGE_SOCKS)
-        bottom.addWidget(badge)
-        bottom.addSpacing(6)
+        addr_row = QHBoxLayout()
+        addr_row.setSpacing(theme.SP_1)
+        self._proxy_lbl = label(f"127.0.0.1:{self.config.socks_port}", "mono")
+        addr_row.addWidget(self._proxy_lbl)
+        self._btn_copy = icon_button("copy", tr("btn.copy"), theme.ICON_SM)
+        self._btn_copy.clicked.connect(self._copy_proxy)
+        addr_row.addWidget(self._btn_copy)
+        addr.addLayout(addr_row)
+        row.addLayout(addr)
+        row.addSpacing(theme.SP_3)
 
-        self._proxy_lbl = QLabel(f"127.0.0.1:{self.config.socks_port}")
-        self._proxy_lbl.setFont(QFont("JetBrains Mono", 12))
-        self._proxy_lbl.setStyleSheet("color:#6a6a8a;")
-        bottom.addWidget(self._proxy_lbl)
-        bottom.addStretch()
+        self._btn_connect = QPushButton(tr("btn.connect"))
+        self._btn_connect.setObjectName("primary")
+        self._btn_connect.setCursor(Qt.PointingHandCursor)
+        self._btn_connect.setMinimumWidth(180)
+        self._btn_connect.setFixedHeight(40)
+        self._btn_connect.clicked.connect(self._toggle_connection)
+        row.addWidget(self._btn_connect, 0, Qt.AlignVCenter)
+        lay.addLayout(row)
 
-        btn_copy = QPushButton(tr("btn.copy"))
-        btn_copy.setFixedHeight(30)
-        btn_copy.setMinimumWidth(110)
-        btn_copy.setCursor(Qt.PointingHandCursor)
-        btn_copy.clicked.connect(self._copy_proxy)
-        bottom.addWidget(btn_copy)
-        lay.addLayout(bottom)
-
+        # Прогресс bootstrap — только во время подключения.
         self._boot_bar = QProgressBar()
         self._boot_bar.setRange(0, 100)
-        self._boot_bar.setFixedHeight(4)
         self._boot_bar.setVisible(False)
         lay.addWidget(self._boot_bar)
 
-        self._boot_lbl = QLabel("")
-        self._boot_lbl.setObjectName("lbl_secondary")
+        self._boot_lbl = label("", "caption")
         self._boot_lbl.setVisible(False)
         lay.addWidget(self._boot_lbl)
 
+        # Предупреждение о ненайденном tor.exe: молчит, пока всё в порядке.
+        self._warn_row = QFrame()
+        warn_lay = QHBoxLayout(self._warn_row)
+        warn_lay.setContentsMargins(0, 0, 0, 0)
+        warn_lay.setSpacing(theme.SP_2)
+        warn_icon = QLabel()
+        warn_icon.setPixmap(icons.pixmap("warning", theme.ICON_SM, theme.WARN))
+        warn_lay.addWidget(warn_icon, 0, Qt.AlignTop)
+        self._settings_hint = label("", "caption")
+        self._settings_hint.setWordWrap(True)
+        self._settings_hint.setStyleSheet(
+            f"color: {theme.WARN}; font-size: {theme.FS_CAPTION}px;")
+        warn_lay.addWidget(self._settings_hint, 1)
+        lay.addWidget(self._warn_row)
+        self._update_settings_hint()
+
         return self._status_card
 
-    # ---- Connect button ----
-    def _make_connect_btn(self) -> QPushButton:
-        self._btn_connect = QPushButton(tr("btn.connect"))
-        self._btn_connect.setStyleSheet(BTN_CONNECT_STYLE)
-        self._btn_connect.setCursor(Qt.PointingHandCursor)
-        self._btn_connect.setFixedHeight(46)
-        self._btn_connect.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._btn_connect.clicked.connect(self._toggle_connection)
-        return self._btn_connect
+    # ---- Мосты ----
+    def _make_bridges_card(self) -> Card:
+        card = Card(tr("bridge.group_title"))
 
-    # ---- App proxy ----
-    def _make_app_proxy_block(self):
+        # Крупное число + подпись: главный факт секции читается мгновенно.
+        count_row = QHBoxLayout()
+        count_row.setSpacing(theme.SP_2)
+        self._bridges_cnt = label("0", "big_number")
+        count_row.addWidget(self._bridges_cnt, 0, Qt.AlignBottom)
+        self._bridges_cnt_unit = label(tr("bridge.available"), "secondary")
+        count_row.addWidget(self._bridges_cnt_unit, 0, Qt.AlignBottom)
+        count_row.addStretch()
+        card.add_layout(count_row)
+
+        # Транспорт и свежесть данных одной строкой.
+        self._last_update_lbl = label("", "secondary")
+        self._last_update_lbl.setWordWrap(True)
+        card.add(self._last_update_lbl)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(theme.SP_2)
+
+        self._bridge_type = Select()
+        self._bridge_type.addItems(["obfs4", "vanilla", "webtunnel"])
+        idx = self._bridge_type.findText(self.config.bridge_type)
+        self._bridge_type.setCurrentIndex(idx if idx >= 0 else 0)
+        self._bridge_type.setFixedWidth(124)
+        self._bridge_type.currentTextChanged.connect(self._on_bridge_type_changed)
+        controls.addWidget(self._bridge_type)
+
+        self._btn_update = text_button(tr("btn.update_bridges"), "refresh",
+                                       object_name="secondary", color=theme.TEXT)
+        self._btn_update.setCursor(Qt.PointingHandCursor)
+        self._btn_update.setFixedHeight(34)
+        self._btn_update.clicked.connect(self._start_bridge_update)
+        controls.addWidget(self._btn_update)
+        controls.addStretch()
+        card.add_layout(controls)
+
+        self._update_bar = QProgressBar()
+        self._update_bar.setRange(0, 100)
+        self._update_bar.setVisible(False)
+        card.add(self._update_bar)
+
+        # Здоровье источников — одна строка; подробности в отдельном окне.
+        health = QHBoxLayout()
+        health.setSpacing(theme.SP_2)
+        self._sources_icon = QLabel()
+        self._sources_icon.setVisible(False)
+        health.addWidget(self._sources_icon, 0, Qt.AlignVCenter)
+
+        self._sources_lbl = label("", "secondary")
+        health.addWidget(self._sources_lbl, 0, Qt.AlignVCenter)
+        health.addStretch()
+
+        self._btn_diag = text_button(tr("btn.details"))
+        self._btn_diag.setCursor(Qt.PointingHandCursor)
+        self._btn_diag.setVisible(False)
+        self._btn_diag.clicked.connect(self._open_diagnostics)
+        health.addWidget(self._btn_diag, 0, Qt.AlignVCenter)
+
+        self._next_update_lbl = label("", "caption")
+        health.addWidget(self._next_update_lbl, 0, Qt.AlignVCenter)
+        card.add_layout(health)
+
+        self._bridges_empty = EmptyState(tr("bridge.empty_title"))
+        card.add(self._bridges_empty)
+        card.body.addStretch()
+
+        self._bridges_card = card
+        return card
+
+    # ---- Приложения ----
+    def _make_apps_card(self) -> QWidget:
         from gui.app_proxy_widget import AppProxyWidget
         self._app_proxy = AppProxyWidget(self.config, log_fn=self._log)
         return self._app_proxy
 
-    # ---- Bridges block ----
-    def _make_bridges_block(self) -> QGroupBox:
-        group = QGroupBox(tr("bridge.group_title"))
-        lay = QVBoxLayout(group)
-        lay.setSpacing(8)
+    # ---- Активность ----
+    def _make_activity_card(self) -> Card:
+        card = Card(tr("activity.title"))
 
-        row1 = QHBoxLayout()
-        type_lbl = QLabel(tr("bridge.type_label"))
-        type_lbl.setStyleSheet("color: #6a6a8a; font-weight: 600;")
-        row1.addWidget(type_lbl)
+        btn_clear = text_button(tr("btn.clear"))
+        btn_clear.setCursor(Qt.PointingHandCursor)
+        btn_clear.clicked.connect(lambda: self._log_view.clear())
+        card.add_header_widget(btn_clear)
 
-        self._bridge_type = QComboBox()
-        self._bridge_type.addItems(["obfs4", "vanilla", "webtunnel"])
-        idx = self._bridge_type.findText(self.config.bridge_type)
-        self._bridge_type.setCurrentIndex(idx if idx >= 0 else 0)
-        self._bridge_type.setFixedWidth(120)
-        self._bridge_type.currentTextChanged.connect(self._on_bridge_type_changed)
-        row1.addWidget(self._bridge_type)
-        row1.addSpacing(8)
-
-        self._btn_update = QPushButton(tr("btn.update_bridges"))
-        self._btn_update.setObjectName("btn_update")
-        self._btn_update.setCursor(Qt.PointingHandCursor)
-        self._btn_update.setMinimumWidth(110)
-        self._btn_update.clicked.connect(self._start_bridge_update)
-        row1.addWidget(self._btn_update)
-        row1.addStretch()
-
-        self._bridges_cnt = QLabel("0")
-        self._bridges_cnt.setStyleSheet(
-            f"color: {_ACCENT_LT}; font-weight: 700; font-size: 14px;"
-            f"background: rgba(124, 92, 191, 0.1);"
-            "border-radius: 6px; padding: 2px 10px;"
-        )
-        self._bridges_cnt.setToolTip(tr("bridge.count_tooltip"))
-        row1.addWidget(self._bridges_cnt)
-        lay.addLayout(row1)
-
-        self._update_bar = QProgressBar()
-        self._update_bar.setRange(0, 100)
-        self._update_bar.setFixedHeight(4)
-        self._update_bar.setVisible(False)
-        lay.addWidget(self._update_bar)
-
-        row2 = QHBoxLayout()
-        self._last_update_lbl = QLabel(tr("bridge.last_update"))
-        self._last_update_lbl.setObjectName("lbl_secondary")
-        row2.addWidget(self._last_update_lbl)
-        row2.addStretch()
-        self._next_update_lbl = QLabel("")
-        self._next_update_lbl.setObjectName("lbl_secondary")
-        row2.addWidget(self._next_update_lbl)
-        lay.addLayout(row2)
-
-        self._bridge_log = QTextEdit()
-        self._bridge_log.setReadOnly(True)
-        self._bridge_log.setMaximumHeight(55)
-        self._bridge_log.setPlaceholderText(tr("bridge.log_placeholder"))
-        lay.addWidget(self._bridge_log)
-
-        return group
-
-    # ---- Log ----
-    def _make_log_block(self) -> QGroupBox:
-        group = QGroupBox(tr("log.group_title"))
-        lay = QVBoxLayout(group)
+        # Журнал — фоновая информация: низкий, неконтрастный, без рамки.
         self._log_view = QTextEdit()
+        self._log_view.setObjectName("activity")
         self._log_view.setReadOnly(True)
-        self._log_view.setMaximumHeight(90)
+        self._log_view.setFixedHeight(84)
         self._log_view.setPlaceholderText(tr("log.placeholder"))
-        lay.addWidget(self._log_view)
-        return group
+        card.add(self._log_view)
 
-    # ---- Settings row ----
-    def _make_settings_row(self) -> QFrame:
-        frame = QFrame()
-        lay = QHBoxLayout(frame)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(12)
-
-        btn = QPushButton(tr("btn.settings"))
-        btn.setObjectName("btn_settings")
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setFixedHeight(34)
-        btn.clicked.connect(self._open_settings)
-        lay.addWidget(btn)
-
-        self._settings_hint = QLabel("")
-        self._settings_hint.setObjectName("lbl_secondary")
-        self._settings_hint.setWordWrap(True)
-        lay.addWidget(self._settings_hint, 1)
-
-        self._update_settings_hint()
-        return frame
+        self._activity_card = card
+        return card
 
     # ================================================================= signals
 
@@ -393,16 +425,37 @@ class MainWindow(QMainWindow):
 
     # ================================================================= bridge update
 
-    def _on_fetched(self, bridges: list):
-        self._blog(f"Загружено {len(bridges)}. Тестирование...")
+    def _on_fetched(self, result):
+        """
+        Приходит FetchResult. Ни один недоступный источник не является ошибкой,
+        пока хотя бы один ответил. Если не ответил никто — остаёмся на кеше.
+        """
+        self._last_fetch_result = result
+        self._update_source_status(result)
+
+        if self._updating_type and self._updating_type != self.config.bridge_type:
+            # Транспорт переключили во время загрузки — тестировать эти мосты
+            # уже незачем, они относятся к прежнему типу.
+            self._log(tr("msg.update_type_changed", t=self._updating_type))
+            self._set_update_busy(False)
+            self._update_bar.setVisible(False)
+            self._user_requested_update = False
+            self._pending_connect_after_update = False
+            return
+
+        if not result.bridges:
+            # Все источники недоступны либо не дали ни одного валидного моста.
+            # Кеш НЕ трогаем — у пользователя остаются прошлые мосты.
+            self._on_update_failed(result)
+            return
+
+        self._blog(tr("bridge.fetched_testing", n=len(result.bridges)))
         self._update_bar.setValue(10)
 
-        if self._test_thread and self._test_thread.isRunning():
-            self._test_thread.cancel()
-            self._test_thread.wait()
+        self._retire_test_thread()
 
         self._test_thread = BridgeTesterThread(
-            bridges,
+            result.bridges,
             timeout=self.config.test_timeout,
             top_n=self.config.max_bridges,
         )
@@ -416,18 +469,36 @@ class MainWindow(QMainWindow):
         self._blog(msg)
 
     def _on_tested(self, bridges: list):
-        self._bridges = bridges
-        self._save_bridges_cache()
-        self._bridges_cnt.setText(f"{len(bridges)}")
-        self._btn_update.setEnabled(True)
+        self._set_update_busy(False)
         self._update_bar.setValue(100)
+
+        if not bridges:
+            # Мосты скачались, но ни один не отвечает по сети.
+            # Прошлый рабочий набор ценнее пустого — сохраняем его.
+            self._on_update_failed(getattr(self, "_last_fetch_result", None),
+                                   tested_empty=True)
+            return
+
+        fetched_type = self._updating_type or self.config.bridge_type
+        if fetched_type != self.config.bridge_type:
+            # Пользователь переключил транспорт, пока шло обновление.
+            # Принять эти мосты как текущие нельзя — они другого типа.
+            self._log(tr("msg.update_type_changed", t=fetched_type))
+            self._user_requested_update = False
+            self._pending_connect_after_update = False
+            return
+
+        self._bridges = bridges
+        self._using_cache = False
+        self._save_bridges_cache(fetched_type)
+        self._set_bridge_count(len(bridges))
 
         now_iso = datetime.now().isoformat()
         self.config.set("last_bridge_update", now_iso)
         self._refresh_time_labels()
 
-        latencies = [f"{b[1]:.0f}мс" for b in bridges]
-        self._blog(f"Готово: {len(bridges)} мостов ({', '.join(latencies)})")
+        fastest = min(b[1] for b in bridges)
+        self._log(tr("bridge.ready", n=len(bridges), ms=f"{fastest:.0f}"), "ok")
         self._log(tr("msg.bridges_updated", n=len(bridges)))
 
         # Отложенный коннект: пользователь нажал «Подключить», но мостов было < 3
@@ -450,24 +521,145 @@ class MainWindow(QMainWindow):
 
         self._user_requested_update = False
 
-    def _on_fetch_error(self, err: str):
-        self._btn_update.setEnabled(True)
+    def _retire_test_thread(self):
+        """
+        Отменяет предыдущий поток тестирования, не блокируя UI ожиданием.
+
+        Ссылку сохраняем: сборка мусора работающего QThread роняет приложение,
+        а wait() в GUI-потоке подвешивает интерфейс на время таймаутов.
+        Досчитавшие потоки выкидываются здесь же.
+        """
+        self._retired_threads = [
+            t for t in getattr(self, "_retired_threads", []) if not t.isFinished()
+        ]
+        old = self._test_thread
+        if old and old.isRunning():
+            old.cancel()
+            for sig in (old.progress, old.finished, old.error):
+                try:
+                    sig.disconnect()
+                except TypeError:
+                    pass          # уже отключён
+            self._retired_threads.append(old)
+
+    def _update_source_status(self, result):
+        """
+        Показываем число независимых ПОСТАВЩИКОВ, а не файлов.
+
+        «Проверенный» и «полный» списки одного репозитория — не две
+        независимые точки отказа: они недоступны одновременно. Показывать
+        «6/6» там, где реально 4 поставщика, значит внушать пользователю
+        ложное чувство запаса прочности.
+        """
+        ok = len(result.ok_providers)
+        total = result.total_providers
+        healthy = ok == total
+
+        # На главном экране — одна строка. Список источников, хосты и задержки
+        # переехали в окно диагностики: на дашборде это лишний шум.
+        self._sources_icon.setVisible(True)
+        self._sources_icon.setPixmap(icons.pixmap(
+            "check" if healthy else "warning", theme.ICON_SM,
+            theme.OK if healthy else theme.WARN))
+        self._sources_lbl.setText(tr("bridge.sources_status", ok=ok, total=total))
+        self._sources_lbl.setStyleSheet(
+            f"color: {theme.TEXT_DIM if healthy else theme.WARN};"
+            f"font-size: {theme.FS_SMALL}px;")
+        self._btn_diag.setVisible(True)
+
+        dead_providers = sorted(result.all_providers - result.ok_providers)
+        if ok and dead_providers:
+            # Часть поставщиков недоступна — это норма, не ошибка.
+            self._log(tr("msg.some_sources_down",
+                         names=", ".join(dead_providers[:3]), ok=ok))
+
+        # Технические подробности — только в лог-файл
+        for s in result.failed_sources:
+            logger.info(f"Источник недоступен [{s.name}]: {s.error}")
+        for s in result.empty_sources:
+            logger.info(f"Источник пуст [{s.name}]: мостов не содержит")
+
+    def _open_diagnostics(self):
+        from gui.diagnostics_dialog import DiagnosticsDialog
+        DiagnosticsDialog(self._last_fetch_result, self).exec_()
+
+    def _describe_zero_bridges(self, result, tested_empty: bool) -> str:
+        """
+        «0 мостов» бывает по четырём разным причинам, и пользователю нужно
+        сообщать именно ту, что произошла: от неё зависит, что ему делать.
+        """
+        if tested_empty:
+            # Мосты получены, но ни один не отвечает по сети.
+            return tr("bridge.none_reachable")
+        if result is None or not result.any_success:
+            # Ни один источник не ответил — это проблема сети/блокировки.
+            return tr("bridge.all_sources_down")
+        if result.rejected:
+            # Источники ответили, но содержимое не является валидными мостами.
+            return tr("bridge.all_rejected")
+        # Источники ответили и честно вернули пустые списки.
+        return tr("bridge.sources_empty")
+
+    def _on_update_failed(self, result, tested_empty: bool = False):
+        """
+        Обновление не дало мостов. Показываем понятное сообщение и опираемся
+        на кеш, если он есть. Приложение остаётся работоспособным.
+        """
+        self._set_update_busy(False)
         self._update_bar.setVisible(False)
-        self._blog(f"Ошибка: {err}")
-        self._log(f"Ошибка загрузки мостов: {err}")
+        # Запоминаем ДО сброса флагов: диалог показываем только пользователю,
+        # фоновое авто-обновление молча уходит в лог.
+        was_user_initiated = self._user_requested_update or self._pending_connect_after_update
         self._user_requested_update = False
 
-    def _on_test_error(self, err: str):
-        self._btn_update.setEnabled(True)
+        cache = bridge_cache.load()
+        have_local = bool(self._bridges) or bool(cache)
+
+        self._blog(self._describe_zero_bridges(result, tested_empty))
+
+        if have_local:
+            self._using_cache = True
+            self._refresh_time_labels()
+            if not self._bridges and cache:
+                self._bridges = cache.bridges
+                self._set_bridge_count(len(self._bridges))
+            self._log(tr("msg.using_cached_bridges",
+                         n=len(self._bridges), age=cache.age_text()))
+        else:
+            self._log(tr("msg.update_failed_no_cache"))
+            if was_user_initiated:
+                self._alert(tr("alert.bridges_unavailable_title"),
+                            tr("alert.bridges_unavailable_body"))
+
+        if self._pending_connect_after_update:
+            self._pending_connect_after_update = False
+            if self._bridges:
+                self._log(tr("msg.auto_connect_after_update"))
+                self._do_connect()
+            else:
+                self._log(tr("msg.no_bridges_after_update"))
+
+    def _on_fetch_error(self, err: str):
+        self._set_update_busy(False)
         self._update_bar.setVisible(False)
-        self._blog(f"Ошибка: {err}")
-        self._user_requested_update = False
+        self._blog(tr("bridge.all_sources_down"))
+        logger.error(f"Ошибка загрузки мостов: {err}")
+        self._on_update_failed(None)
+
+    def _on_test_error(self, err: str):
+        """
+        Сбой самого тестировщика (не «мосты не отвечают», а исключение внутри).
+        Рабочий набор при этом трогать нельзя — он ни в чём не виноват.
+        """
+        logger.error(f"Ошибка тестирования мостов: {err}")
+        self._on_update_failed(getattr(self, "_last_fetch_result", None),
+                               tested_empty=True)
 
     def _on_bridge_type_changed(self, btype: str):
         self.config.set("bridge_type", btype)
         # Сбрасываем кеш — старые мосты другого типа не подходят
         self._bridges.clear()
-        self._bridges_cnt.setText("0")
+        self._set_bridge_count(0)
         self._log(tr("msg.type_changed", t=btype))
 
     # ================================================================= Tor status
@@ -574,41 +766,59 @@ class MainWindow(QMainWindow):
 
     # ================================================================= UI state
 
+    def _apply_state(self, state: str, status_key: str, hint_key: str):
+        """
+        Единая точка смены визуального состояния.
+
+        Цветом окрашиваются только индикатор, подпись статуса и тонкая полоса
+        слева от герой-блока — не вся карточка целиком.
+        """
+        color = theme.STATUS_COLORS[state]
+        self._dot.setPixmap(icons.dot(color, 9, glow=(state != "disconnected")))
+        self._status_lbl.setText(tr(status_key))
+        self._status_lbl.setStyleSheet(f"color: {color};")
+        self._status_hint.setText(tr(hint_key))
+        self._status_card.setStyleSheet(theme.hero_style(color))
+
     def _set_ui_connected(self):
-        self._dot.setPixmap(dot_pixmap(COLOR_CONNECTED, 14))
-        self._status_lbl.setText(tr("status.connected"))
-        self._status_lbl.setStyleSheet(f"color:{COLOR_CONNECTED};")
-        self._status_card.setStyleSheet(CARD_CONNECTED)
+        self._apply_state("connected", "status.connected", "status.hint.connected")
         self._boot_bar.setVisible(False)
         self._boot_lbl.setVisible(False)
         self._btn_connect.setText(tr("btn.disconnect"))
-        self._btn_connect.setStyleSheet(BTN_DISCONNECT_STYLE)
+        self._btn_connect.setObjectName("danger")
+        self._btn_connect.setIcon(icons.icon("power", theme.ICON_SM, theme.ERR))
+        self._restyle(self._btn_connect)
         self._btn_connect.setEnabled(True)
 
     def _set_ui_connecting(self):
-        self._dot.setPixmap(dot_pixmap(COLOR_CONNECTING, 14))
-        self._status_lbl.setText(tr("status.connecting"))
-        self._status_lbl.setStyleSheet(f"color:{COLOR_CONNECTING};")
-        self._status_card.setStyleSheet(CARD_CONNECTING)
+        self._apply_state("connecting", "status.connecting", "status.hint.connecting")
         self._boot_bar.setValue(0)
         self._boot_bar.setVisible(True)
         self._boot_lbl.setText(tr("boot.init"))
         self._boot_lbl.setVisible(True)
         self._btn_connect.setText(tr("btn.connecting"))
-        self._btn_connect.setStyleSheet(BTN_CONNECTING_STYLE)
+        self._btn_connect.setObjectName("primary")
+        self._btn_connect.setIcon(QIcon())
+        self._restyle(self._btn_connect)
         self._btn_connect.setEnabled(False)
 
     def _set_ui_disconnected(self):
-        self._dot.setPixmap(dot_pixmap(COLOR_DISCONNECTED, 14))
-        self._status_lbl.setText(tr("status.disconnected"))
-        self._status_lbl.setStyleSheet("")
-        self._status_card.setStyleSheet(CARD_DEFAULT)
+        self._apply_state("disconnected", "status.disconnected",
+                          "status.hint.disconnected")
         self._boot_bar.setVisible(False)
         self._boot_lbl.setVisible(False)
         self._uptime_lbl.setText("")
         self._btn_connect.setText(tr("btn.connect"))
-        self._btn_connect.setStyleSheet(BTN_CONNECT_STYLE)
+        self._btn_connect.setObjectName("primary")
+        self._btn_connect.setIcon(icons.icon("power", theme.ICON_SM, "#ffffff"))
+        self._restyle(self._btn_connect)
         self._btn_connect.setEnabled(True)
+
+    @staticmethod
+    def _restyle(widget: QWidget):
+        """Qt не перечитывает стиль сам после смены objectName."""
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
 
     # ================================================================= timeout
 
@@ -642,12 +852,16 @@ class MainWindow(QMainWindow):
 
         if self._fetch_thread and self._fetch_thread.isRunning():
             if not background:
-                self._blog("Обновление уже выполняется...")
+                self._blog(tr("bridge.already_updating"))
             return
 
         btype = self._bridge_type.currentText()
-        self._blog(f"Загрузка ({btype})...")
-        self._btn_update.setEnabled(False)
+        # Тип фиксируется на всё время обновления. Пользователь может
+        # переключить транспорт, пока идёт загрузка, — результат обязан
+        # остаться привязанным к тому типу, для которого его запрашивали.
+        self._updating_type = btype
+        self._blog(tr("bridge.fetching", transport=btype))
+        self._set_update_busy(True)
         self._update_bar.setValue(0)
         self._update_bar.setVisible(True)
 
@@ -662,25 +876,64 @@ class MainWindow(QMainWindow):
             s = int(time.time() - self._start_time)
             self._uptime_lbl.setText(f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}")
 
+    @staticmethod
+    def _humanize_age(dt: datetime) -> str:
+        """«2 минуты назад» вместо «08.08 05:36» — так понятнее без вычислений."""
+        secs = int((datetime.now() - dt).total_seconds())
+        if secs < 90:
+            return tr("time.just_now")
+        if secs < 3600:
+            return tr("time.minutes_ago", n=secs // 60)
+        if secs < 86400:
+            return tr("time.hours_ago", n=secs // 3600)
+        if secs < 7 * 86400:
+            return tr("time.days_ago", n=secs // 86400)
+        return dt.strftime("%d.%m.%Y")
+
     def _refresh_time_labels(self):
+        """
+        Строка вида «obfs4 · обновлены 5 минут назад».
+
+        Если последнее обновление не удалось, здесь же честно сообщается,
+        что показываются сохранённые мосты — это важнее, чем таймер.
+        """
+        transport = self.config.bridge_type
         last = self.config.last_bridge_update
-        if last:
-            try:
-                dt = datetime.fromisoformat(last)
-                self._last_update_lbl.setText(dt.strftime("%d.%m %H:%M"))
-                next_dt = dt + timedelta(hours=self.config.auto_update_hours)
-                diff = next_dt - datetime.now()
-                total_sec = int(diff.total_seconds())
-                if total_sec > 0:
-                    h, rem = divmod(total_sec, 3600)
-                    m = rem // 60
-                    self._next_update_lbl.setText(tr("bridge.next_update_in", h=h, m=m))
-                else:
-                    self._next_update_lbl.setText(tr("bridge.next_update_now"))
-            except Exception:
-                pass
+
+        if not last:
+            self._last_update_lbl.setText(
+                tr("bridge.meta_never", transport=transport))
+            self._next_update_lbl.setText("")
+            return
+
+        try:
+            dt = datetime.fromisoformat(last)
+        except Exception:
+            self._last_update_lbl.setText(
+                tr("bridge.meta_never", transport=transport))
+            self._next_update_lbl.setText("")
+            return
+
+        age = self._humanize_age(dt)
+        if self._using_cache:
+            self._last_update_lbl.setText(
+                tr("bridge.meta_cached", transport=transport, age=age))
+            self._last_update_lbl.setStyleSheet(
+                f"color: {theme.WARN}; font-size: {theme.FS_SMALL}px;")
         else:
-            self._last_update_lbl.setText(tr("bridge.no_data"))
+            self._last_update_lbl.setText(
+                tr("bridge.meta", transport=transport, age=age))
+            self._last_update_lbl.setStyleSheet(
+                f"color: {theme.TEXT_DIM}; font-size: {theme.FS_SMALL}px;")
+
+        total_sec = int((dt + timedelta(hours=self.config.auto_update_hours)
+                         - datetime.now()).total_seconds())
+        if total_sec > 0:
+            h, rem = divmod(total_sec, 3600)
+            self._next_update_lbl.setText(
+                tr("bridge.next_update_in", h=h, m=rem // 60))
+        else:
+            self._next_update_lbl.setText(tr("bridge.next_update_now"))
 
     def _check_auto_update(self):
         """Фоновое обновление по расписанию — НЕ перезапускает Tor (избегаем неожиданных разрывов)."""
@@ -702,49 +955,101 @@ class MainWindow(QMainWindow):
         self._user_requested_update = False
         self._start_bridge_update(background=True)
 
-    def _save_bridges_cache(self):
-        try:
-            data = [{"bridge": b[0], "latency": b[1]} for b in self._bridges]
-            BRIDGES_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.error(f"Ошибка сохранения кеша: {e}")
+    def _save_bridges_cache(self, bridge_type: str | None = None):
+        bridge_cache.save(self._bridges, bridge_type or self.config.bridge_type)
 
     def _load_bridges_cache(self):
-        if BRIDGES_FILE.exists():
-            try:
-                items = json.loads(BRIDGES_FILE.read_text(encoding="utf-8"))
-                self._bridges = [(i["bridge"], i["latency"]) for i in items]
-                self._bridges_cnt.setText(f"{len(self._bridges)}")
-                self._log(tr("msg.bridges_loaded", n=len(self._bridges)))
-            except Exception as e:
-                logger.error(f"Ошибка загрузки кеша: {e}")
+        """
+        Кеш применяется, только если он относится к текущему типу мостов —
+        иначе после смены типа приложение подключалось бы старыми мостами
+        другого транспорта.
+        """
+        cache = bridge_cache.load()
+        if not cache:
+            return
+
+        if not cache.matches_type(self.config.bridge_type):
+            logger.info(
+                f"Кеш относится к типу {cache.bridge_type}, "
+                f"текущий {self.config.bridge_type} — пропускаем"
+            )
+            return
+
+        self._bridges = cache.bridges
+        self._set_bridge_count(len(self._bridges))
+        self._log(tr("msg.bridges_loaded_age",
+                     n=len(self._bridges), age=cache.age_text()))
+
+    def _set_update_busy(self, busy: bool):
+        """Кнопка обновления сообщает о ходе работы, а не просто гаснет."""
+        self._btn_update.setEnabled(not busy)
+        self._btn_update.setText(
+            tr("btn.updating") if busy else tr("btn.update_bridges"))
+        if not busy:
+            self._update_bar.setVisible(False)
+
+    @staticmethod
+    def _group_number(n: int) -> str:
+        """
+        Разделитель разрядов по языку: «5 194» для русского, «5,194» для
+        английского. Узкий неразрывный пробел не даёт числу разорваться.
+        """
+        grouped = f"{n:,}"
+        return grouped if current_language() == "en" else grouped.replace(",", " ")
+
+    def _set_bridge_count(self, n: int):
+        """Счётчик и пустое состояние всегда меняются вместе."""
+        self._bridges_cnt.setText(self._group_number(n))
+        self._bridges_cnt.setStyleSheet(
+            f"color: {theme.TEXT if n else theme.TEXT_MUTE};")
+        self._bridges_empty.setVisible(n == 0)
 
     def _update_settings_hint(self):
+        """Показываем только проблему: исправное состояние не требует подписи."""
         tor = self.config.tor_exe
-        if tor and Path(tor).exists():
-            self._settings_hint.setText(tr("hint.tor_ok", name=Path(tor).name))
-        else:
+        ok = bool(tor) and Path(tor).exists()
+        self._warn_row.setVisible(not ok)
+        if not ok:
             self._settings_hint.setText(tr("hint.tor_not_found"))
 
-    def _log(self, msg: str):
-        ts = datetime.now().strftime("%H:%M:%S")
+    def _log(self, msg: str, tone: str = ""):
+        """
+        Единый журнал активности. tone подсвечивает строку, но приглушённо:
+        журнал — второстепенная информация и не должен спорить со статусом.
+        """
+        color = {
+            "ok": theme.OK,
+            "warn": theme.WARN,
+            "err": theme.ERR,
+        }.get(tone, theme.TEXT_DIM)
+
+        ts = datetime.now().strftime("%H:%M")
+        safe = html.escape(str(msg))
         self._log_view.append(
-            f"<span style='color:#44445a'>[{ts}]</span> "
-            f"<span style='color:#c8c8d8'>{msg}</span>"
+            f"<span style='color:{theme.TEXT_MUTE}'>{ts}</span>&nbsp;&nbsp;"
+            f"<span style='color:{color}'>{safe}</span>"
         )
         sb = self._log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
     def _blog(self, msg: str):
-        self._bridge_log.append(msg)
-        sb = self._bridge_log.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        """
+        Раньше сообщения об обновлении мостов шли в отдельное текстовое поле.
+        Два журнала рядом — лишний визуальный блок; теперь запись одна.
+        """
+        text = str(msg)
+        tone = ""
+        if text.startswith("[OK]"):
+            tone, text = "ok", text[4:].strip()
+        elif text.startswith("[--]"):
+            tone, text = "warn", text[4:].strip()
+        self._log(text, tone)
 
     def _alert(self, title: str, text: str):
         msg = QMessageBox(self)
         msg.setWindowTitle(title)
         msg.setText(text)
-        msg.setStyleSheet(DARK_THEME)
+        msg.setStyleSheet(theme.THEME)
         msg.exec_()
 
     # ================================================================= close → tray
@@ -754,11 +1059,40 @@ class MainWindow(QMainWindow):
         self.hide()
 
     def shutdown(self):
-        """Полное завершение — останавливаем таймеры и процессы."""
+        """Полное завершение — останавливаем таймеры, потоки и процессы."""
         self._uptime_timer.stop()
         self._connect_timeout.stop()
         self._auto_update_timer.stop()
         self._next_update_timer.stop()
+
+        # Рабочие потоки нужно завершить: уничтожение работающего QThread
+        # роняет приложение ("QThread: Destroyed while thread is still running").
+        #
+        # cancel() проверяется между запросами, но прервать уже начатое
+        # блокирующее чтение сокета переносимо нельзя — поток может висеть
+        # до истечения сетевого таймаута.
+        #
+        # QThread.terminate() здесь применять НЕЛЬЗЯ: поток исполняет Python и
+        # в момент снятия почти наверняка держит GIL. TerminateThread оставляет
+        # его захваченным, и интерпретатор падает с access violation уже на
+        # выходе. Проверено — именно так и происходит.
+        #
+        # Поэтому: ждём ограниченное время, а не дождавшись — оставляем поток
+        # доживать, но удерживаем на него ссылку, чтобы Qt не разрушил
+        # работающий объект. Процесс всё равно завершается, сокеты закроет ОС.
+        threads = [self._fetch_thread, self._test_thread]
+        threads += getattr(self, "_retired_threads", [])
+        for thread in threads:
+            if not (thread and thread.isRunning()):
+                continue
+            thread.cancel()
+            if not thread.wait(_SHUTDOWN_GRACE_MS):
+                logger.warning(
+                    "Поток не завершился за %d мс — оставлен дорабатывать",
+                    _SHUTDOWN_GRACE_MS,
+                )
+                _LINGERING_THREADS.append(thread)
+
         if hasattr(self, "_app_proxy"):
             self._app_proxy.stop_all()
         self.tor_manager.stop()

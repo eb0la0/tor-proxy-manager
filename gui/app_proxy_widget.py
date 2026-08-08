@@ -1,17 +1,18 @@
 """
-Виджет управления приложениями, запущенными через Tor-прокси.
-Автоматически выбирает лучший метод для каждого типа приложения.
+Панель «Приложения через прокси».
+
+Список приложений подаётся как строки-объекты: имя, способ проксирования
+и одно понятное действие. Технические подробности (полный путь, метод)
+доступны, но не занимают первый план.
 """
 import logging
 import webbrowser
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
-    QGroupBox, QVBoxLayout, QHBoxLayout, QFrame,
+    QVBoxLayout, QHBoxLayout, QFrame,
     QLabel, QPushButton, QFileDialog, QMessageBox,
-    QSizePolicy,
 )
 
 from core.app_proxy import (
@@ -20,30 +21,31 @@ from core.app_proxy import (
     launch_proxied,
     PROXYCHAINS_GITHUB,
 )
-from gui.styles import (
-    APP_ROW_STYLE, APP_ROW_RUNNING_BTN, APP_ROW_LAUNCH_BTN, BADGE_METHOD,
-    COLOR_CONNECTED, COLOR_DISCONNECTED, dot_pixmap,
-)
+from core.i18n import tr
+from gui import icons, theme
+from gui.widgets import Card, StatusPill, label, text_button
 
 logger = logging.getLogger(__name__)
 
-_METHOD_LABELS = {
-    "proxy-server": "встроенный прокси",
-    "firefox-profile": "профиль Firefox",
-    "proxychains": "proxychains",
-    "env-proxy": "env-proxy",
+_METHOD_KEYS = {
+    "proxy-server": "app.method.proxy_server",
+    "firefox-profile": "app.method.firefox",
+    "proxychains": "app.method.proxychains",
+    "env-proxy": "app.method.env",
+}
+
+_TYPE_METHOD = {
+    "chromium": "proxy-server",
+    "firefox": "firefox-profile",
+    "generic": "proxychains",
 }
 
 
-_DOT_RUN = dot_pixmap(COLOR_CONNECTED, 10)
-_DOT_STOP = dot_pixmap(COLOR_DISCONNECTED, 10)
-
-
-class AppProxyWidget(QGroupBox):
-    """Панель «Приложения через прокси»."""
+class AppProxyWidget(Card):
+    """Секция со списком приложений, запускаемых через прокси."""
 
     def __init__(self, config, log_fn=None, parent=None):
-        super().__init__("Приложения через прокси", parent)
+        super().__init__(tr("app.group_title"), parent=parent)
         self.config = config
         self._log_fn = log_fn
         self._rows: dict = {}          # path → {frame, dot, btn, name_lbl, badge}
@@ -51,6 +53,7 @@ class AppProxyWidget(QGroupBox):
 
         self._build_ui()
         self._load_apps()
+        self._refresh_empty_state()
 
         # Таймер проверки статуса процессов (каждые 2 сек)
         self._poll = QTimer(self)
@@ -60,62 +63,64 @@ class AppProxyWidget(QGroupBox):
     # ================================================================= build
 
     def _build_ui(self):
-        lay = QVBoxLayout(self)
-        lay.setSpacing(6)
+        # Третичное действие: только текст с иконкой. Пунктирная рамка на
+        # пустой карточке выглядела тяжелее, чем само содержимое.
+        self._btn_add = text_button(tr("app.add"), "plus", color=theme.ACCENT)
+        self._btn_add.setCursor(Qt.PointingHandCursor)
+        self._btn_add.setMinimumHeight(30)
+        self._btn_add.clicked.connect(self._on_add)
+        self.add_header_widget(self._btn_add)
 
-        # --- Статус proxychains ---
-        self._pc_status = QLabel()
-        self._pc_status.setObjectName("lbl_secondary")
+        # Предупреждение о proxychains — только когда оно актуально.
+        self._notice = QFrame()
+        notice_lay = QHBoxLayout(self._notice)
+        notice_lay.setContentsMargins(theme.SP_3, theme.SP_2, theme.SP_3, theme.SP_2)
+        notice_lay.setSpacing(theme.SP_2)
+
+        self._notice_icon = QLabel()
+        self._notice_icon.setPixmap(icons.pixmap("warning", theme.ICON_SM, theme.WARN))
+        notice_lay.addWidget(self._notice_icon, 0, Qt.AlignTop)
+
+        self._pc_status = label("", "caption")
         self._pc_status.setWordWrap(True)
-        lay.addWidget(self._pc_status)
+        notice_lay.addWidget(self._pc_status, 1)
 
-        self._btn_download = QPushButton("Скачать proxychains-windows")
-        self._btn_download.setObjectName("btn_update")
-        self._btn_download.setCursor(Qt.PointingHandCursor)
-        self._btn_download.setFixedWidth(280)
+        self._btn_download = text_button(tr("app.download_proxychains"), "download")
         self._btn_download.clicked.connect(
             lambda: webbrowser.open(PROXYCHAINS_GITHUB)
         )
-        lay.addWidget(self._btn_download)
+        notice_lay.addWidget(self._btn_download, 0, Qt.AlignTop)
+        self.add(self._notice)
+
+        self._list_lay = QVBoxLayout()
+        self._list_lay.setSpacing(theme.SP_2)
+        self.add_layout(self._list_lay)
+
+        # Пустое состояние — одна строка. Заголовок + описание + кнопка
+        # раздували карточку сильнее, чем реальный список приложений.
+        self._empty = label(tr("app.empty_hint"), "secondary")
+        self._empty.setWordWrap(True)
+        self.add(self._empty)
+        self.body.addStretch()
 
         self._refresh_pc_status()
-
-        # --- Список приложений ---
-        self._list_lay = QVBoxLayout()
-        self._list_lay.setSpacing(4)
-        lay.addLayout(self._list_lay)
-
-        # --- Кнопка добавления ---
-        row_add = QHBoxLayout()
-        btn_add = QPushButton("+ Добавить приложение")
-        btn_add.setObjectName("btn_add_app")
-        btn_add.setCursor(Qt.PointingHandCursor)
-        btn_add.setFixedWidth(220)
-        btn_add.setFixedHeight(36)
-        btn_add.clicked.connect(self._on_add)
-        row_add.addWidget(btn_add)
-        row_add.addStretch()
-        lay.addLayout(row_add)
 
     # ================================================================= proxychains status
 
     def _refresh_pc_status(self):
         pc = find_proxychains_exe()
         if pc:
-            self._pc_status.setText(
-                f"proxychains: {Path(pc).name}\n"
-                "Браузеры: авто-настройка (без proxychains)"
-            )
-            self._pc_status.setStyleSheet(f"color: {COLOR_CONNECTED}; font-size: 11px;")
-            self._btn_download.setVisible(False)
+            # Всё на месте — не занимать место предупреждением.
+            self._notice.setVisible(False)
         else:
-            self._pc_status.setText(
-                "Браузеры: авто-настройка прокси\n"
-                "Другие приложения: proxychains не найден — "
-                "положите в папку tools/ (или используется fallback)"
-            )
-            self._pc_status.setStyleSheet("color: #ffa502; font-size: 11px;")
+            self._notice.setVisible(True)
+            self._pc_status.setText(tr("app.proxychains_missing"))
+            self._pc_status.setStyleSheet(
+                f"color: {theme.TEXT_DIM}; font-size: {theme.FS_CAPTION}px;")
             self._btn_download.setVisible(True)
+
+    def _refresh_empty_state(self):
+        self._empty.setVisible(not self._rows)
 
     # ================================================================= app list persistence
 
@@ -137,53 +142,50 @@ class AppProxyWidget(QGroupBox):
 
     def _add_row(self, name: str, path: str):
         frame = QFrame()
-        frame.setObjectName("app_row")
-        frame.setStyleSheet(APP_ROW_STYLE)
+        frame.setObjectName("row")
         row = QHBoxLayout(frame)
-        row.setContentsMargins(12, 8, 8, 8)
-        row.setSpacing(10)
+        row.setContentsMargins(theme.SP_3, theme.SP_2, theme.SP_2, theme.SP_2)
+        row.setSpacing(theme.SP_3)
 
         dot_lbl = QLabel()
         dot_lbl.setFixedSize(10, 10)
-        dot_lbl.setPixmap(_DOT_STOP)
-        row.addWidget(dot_lbl)
+        dot_lbl.setPixmap(icons.dot(theme.TEXT_MUTE, 8))
+        row.addWidget(dot_lbl, 0, Qt.AlignVCenter)
 
-        name_lbl = QLabel(name)
-        name_lbl.setFont(QFont("Segoe UI", 12, QFont.DemiBold))
+        # Имя приложения крупнее, файл — подписью: так строка читается сразу.
+        texts = QVBoxLayout()
+        texts.setSpacing(1)
+        name_lbl = label(name)
+        name_lbl.setStyleSheet(f"font-size: {theme.FS_BODY}px; font-weight: 500;")
         name_lbl.setToolTip(path)
-        name_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        row.addWidget(name_lbl, 1)
+        texts.addWidget(name_lbl)
 
-        # Бейдж с методом проксирования
+        file_lbl = label(Path(path).name, "caption")
+        file_lbl.setToolTip(path)
+        texts.addWidget(file_lbl)
+        row.addLayout(texts, 1)
+
         app_type = detect_app_type(path)
-        method_txt = {
-            "chromium": "proxy-server",
-            "firefox": "profile",
-            "generic": "proxychains",
-        }.get(app_type, "?")
-        badge = QLabel(method_txt)
-        badge.setStyleSheet(BADGE_METHOD)
-        row.addWidget(badge)
+        method = _TYPE_METHOD.get(app_type, "proxychains")
+        badge = StatusPill(tr(_METHOD_KEYS.get(method, "app.method.proxychains")),
+                           theme.TEXT_DIM, theme.SURFACE)
+        row.addWidget(badge, 0, Qt.AlignVCenter)
 
-        btn = QPushButton("Запустить")
+        btn = text_button(tr("app.launch"), "play", object_name="", color=theme.TEXT)
         btn.setCursor(Qt.PointingHandCursor)
-        btn.setFixedWidth(110)
+        btn.setMinimumWidth(132)
         btn.setFixedHeight(32)
-        btn.setStyleSheet(APP_ROW_LAUNCH_BTN)
         btn.clicked.connect(lambda checked, p=path: self._toggle(p))
-        row.addWidget(btn)
+        row.addWidget(btn, 0, Qt.AlignVCenter)
 
-        btn_rm = QPushButton("\u00d7")       # x
+        btn_rm = QPushButton()
+        btn_rm.setObjectName("icon_btn")
+        btn_rm.setIcon(icons.icon("trash", theme.ICON_SM, theme.TEXT_MUTE))
         btn_rm.setCursor(Qt.PointingHandCursor)
-        btn_rm.setFixedWidth(30)
-        btn_rm.setFixedHeight(30)
-        btn_rm.setStyleSheet(
-            "QPushButton { background: transparent; color: #6a6a8a;"
-            "  font-size: 18px; border: none; border-radius: 6px; }"
-            "QPushButton:hover { color: #ff4757; background: rgba(255,71,87,0.1); }"
-        )
+        btn_rm.setFixedSize(30, 30)
+        btn_rm.setToolTip(tr("app.remove"))
         btn_rm.clicked.connect(lambda checked, p=path: self._remove(p))
-        row.addWidget(btn_rm)
+        row.addWidget(btn_rm, 0, Qt.AlignVCenter)
 
         self._list_lay.addWidget(frame)
         self._rows[path] = {
@@ -194,6 +196,7 @@ class AppProxyWidget(QGroupBox):
             "badge": badge,
             "name": name,
         }
+        self._refresh_empty_state()
 
     def _remove(self, path: str):
         self._stop_app(path)
@@ -202,6 +205,7 @@ class AppProxyWidget(QGroupBox):
             info["frame"].setParent(None)
             info["frame"].deleteLater()
         self._save_apps()
+        self._refresh_empty_state()
 
     # ================================================================= launch / stop
 
@@ -214,10 +218,8 @@ class AppProxyWidget(QGroupBox):
 
     def _launch_app(self, path: str):
         if not Path(path).exists():
-            QMessageBox.warning(
-                self, "Ошибка",
-                f"Файл не найден:\n{path}"
-            )
+            QMessageBox.warning(self, tr("alert.error_title"),
+                                tr("app.file_missing", path=path))
             return
 
         self._refresh_pc_status()
@@ -228,15 +230,13 @@ class AppProxyWidget(QGroupBox):
             self._procs[path] = proc
             self._set_row_running(path, True)
             name = self._rows[path]["name"]
-            label = _METHOD_LABELS.get(method, method)
-            self._log(f"Запущено: {name} [{label}] (PID {proc.pid})")
+            label_txt = tr(_METHOD_KEYS.get(method, "app.method.proxychains"))
+            self._log(tr("app.launched", name=name, method=label_txt, pid=proc.pid))
 
         except Exception as e:
             logger.error(f"Не удалось запустить {path}: {e}")
-            QMessageBox.warning(
-                self, "Ошибка запуска",
-                f"Не удалось запустить:\n{e}"
-            )
+            QMessageBox.warning(self, tr("app.launch_failed_title"),
+                                tr("app.launch_failed_body", err=e))
 
     def _stop_app(self, path: str):
         proc = self._procs.pop(path, None)
@@ -250,7 +250,7 @@ class AppProxyWidget(QGroupBox):
             except Exception:
                 pass
             name = self._rows.get(path, {}).get("name", path)
-            self._log(f"Остановлено: {name}")
+            self._log(tr("app.stopped", name=name))
         self._set_row_running(path, False)
 
     def stop_all(self):
@@ -264,12 +264,13 @@ class AppProxyWidget(QGroupBox):
         info = self._rows.get(path)
         if not info:
             return
-        info["dot"].setPixmap(_DOT_RUN if running else _DOT_STOP)
-        info["btn"].setText("Остановить" if running else "Запустить")
-        if running:
-            info["btn"].setStyleSheet(APP_ROW_RUNNING_BTN)
-        else:
-            info["btn"].setStyleSheet(APP_ROW_LAUNCH_BTN)
+        info["dot"].setPixmap(
+            icons.dot(theme.OK, 8, glow=True) if running
+            else icons.dot(theme.TEXT_MUTE, 8))
+        info["btn"].setText(tr("app.stop") if running else tr("app.launch"))
+        info["btn"].setIcon(icons.icon(
+            "stop" if running else "play", theme.ICON_SM,
+            theme.ERR if running else theme.TEXT))
 
     def _poll_processes(self):
         """Обновить статус завершившихся процессов."""
@@ -283,13 +284,14 @@ class AppProxyWidget(QGroupBox):
 
     def _on_add(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите приложение", "",
-            "Приложения (*.exe);;Все файлы (*)"
+            self, tr("app.choose_title"), "",
+            tr("app.file_filter")
         )
         if not path:
             return
         if path in self._rows:
-            QMessageBox.information(self, "Дубликат", "Это приложение уже добавлено.")
+            QMessageBox.information(self, tr("app.duplicate_title"),
+                                    tr("app.duplicate_body"))
             return
         name = Path(path).stem
         self._add_row(name, path)

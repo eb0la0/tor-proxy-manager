@@ -48,7 +48,7 @@ def main() -> int:
             tr("already_running_body"),
         )
         return 0
-    app.setApplicationVersion("1.0.0")
+    app.setApplicationVersion("2.0.0")
     app.setQuitOnLastWindowClosed(False)
 
     # Иконка приложения (генерируется программно)
